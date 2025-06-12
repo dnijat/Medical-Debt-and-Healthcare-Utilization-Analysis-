@@ -1,0 +1,254 @@
+---
+title: "Project"
+author: "Diyanet Nijiati"
+date: "2025-05-23"
+output: word_document
+---
+
+## Motivation
+Medical debt is a powerful marker of structural inequity in the U.S. healthcare system. Unlike other forms of debt, medical debt is rarely incurred by choice and often reflects structural deficiencies in insurance coverage, and public health infrastructure. Individuals from low-income and historically marginalized communities are disproportionately affected, facing heightened risks of financial hardship, stress, and delayed or forgone medical care. 
+
+Despite the scale and impact of debt relief efforts, the broader consequences of medical debt on healthcare utilization, mental health, and persistent disparities remain underexplored in policy and research. For example, does abolishing medical debt encourage people to return for needed care? Are there meaningful differences in how medical debt affects access to care and stress across demographic groups? And how should financial wellness be measured beyond conventional credit metrics?
+
+My lab is partnering with Undue Medical Debt (UMD), a nonprofit that has abolished over $15 billion in medical debt for more than 10 million low-income and vulnerable Americans since 2014, to generate evidence on the broader impacts of debt relief beyond credit score improvements. In this project, I will leverage 2023 panel of Survey of Income and Program Participation (SIPP) data to examine the relationships between medical debt, healthcare utilization, and mental health. In specific, (1) does owing medical debt reduce an individual’s likelihood of seeking medical care? (2) how this effect varies by race, sex, and income, and (3) the association between debt burden and psychological distress. Clarifying these relationships will inform targeted policies and interventions to alleviate financial stress, improve access, and prevent avoidable health complications.
+
+```{r}
+library(naniar)
+library(data.table)
+library(bit64)
+library(tidyverse)
+library(rio)
+library(tidylog)
+library(Hmisc)
+library(jtools)
+library(dplyr)
+library(MASS)
+library(pscl)
+library(ggplot2)
+library(effects)
+```
+
+```{r}
+setwd("/Users/diyanetnijat/Downloads/R")
+```
+
+```{r}
+pu <- fread("pu2023.csv", sep = "|", select = c(
+  "SSUID","PNUM","MONTHCODE","ERESIDENCEID","ERELRPE","SPANEL", # IDs
+  "ESEX","TAGE","EEDUC","TRACE","TPTOTINC", # Demographics
+  "TMED_AMT","EDEBT_MED", #Medical debt
+  "TVISDOC", #Doctors visits
+  "RCONDTYP1" #Health conditions
+))
+
+# filter December 2023 data
+pu12 <- pu %>% filter(SPANEL == 2023, MONTHCODE == 12, TAGE >= 21)
+```
+
+```{r}
+pu12$Race <- as.factor(case_when(pu12$TRACE == 1 ~ "White",
+                      pu12$TRACE == 2 ~ "Black",
+                      pu12$TRACE == 3 ~ "AIAN",
+                      pu12$TRACE == 4 ~ "Asian",
+                      pu12$TRACE %in% 6:9 ~ "Multiracial",
+                      TRUE ~ "Other"))
+
+pu12$Race <- relevel(pu12$Race, ref = "White")
+
+pu12$Educ <- as.factor(case_when(pu12$EEDUC %in% 31:39 ~ "HS diploma or less",
+                                 pu12$EEDUC %in% 40:42 ~ "Some college or Associate",
+                                 pu12$EEDUC == 43 ~ "Bachelor",
+                                 pu12$EEDUC %in% 44:46 ~ "Masters or above"))
+
+pu12$Educ <- relevel(pu12$Educ, ref = "HS diploma or less")
+```
+
+```{r}
+pu12 <- pu12 %>% mutate(Sex = ifelse(ESEX == 1, 1, 0),
+                        Age = as.numeric(TAGE),
+                        DocVisit = as.numeric(TVISDOC),
+                        VisitedDoc = ifelse(DocVisit > 0, 1, 0),
+                        LogIncome = ifelse(TPTOTINC > 0, log(TPTOTINC + 1), NA),
+                        HasDebt = ifelse(EDEBT_MED == 1, 1, 0),
+                        LogDebtAmount = ifelse(HasDebt == 1, log(TMED_AMT + 1), NA),
+                        MentalHealth = ifelse(RCONDTYP1 == 9, 1, 0))
+```
+## Data Description
+
+I used 2023 panel of the Survey of Income and Program Participation (SIPP), administered by the U.S. Census Bureau. It follows a sample of civilian, non-institutionalized U.S. residents, collecting detailed information on income, program participation, health, and demographics. For this project, the analytic sample is restricted to adults age 21 and older, and records are limited to the December wave to ensure that annual summary variables, such as medical debt and doctor visits, are consistently measured.
+
+#### Key Variables
+Medical debt: HasDebt(binary indicator for whether any medical debt is owed, derived from EDEBT_MED); LogDebtAmount(continuous, log transformed unpaid medical debt from TMED_AMT).
+
+Healthcare utilization: DocVisit(count of any medical provider visits in the past year, TVISDOC); VisitedDoc(binary indicator for whether the individual had any doctor visits).
+
+Demographics: age(continuous), sex(binary), race(categorical), education(categorical), income (LogIncome, log transfromed from monthly income).
+
+MentalHealth(binary, equals 1 if respondent reported a mental or emotional disorder RCONDTYP1 == 9).
+
+#### Missing Data
+```{r}
+# identify missing data
+miss_var_summary(pu12)
+```
+Medical debt amount and log transformed debt are about 90% missing. Only those with medical debt are asked about the amount. A small number of respondents reported having medical debt but a debt amount of zero. These cases were addressed within a two-part modeling approach: modeling debt presence for all, and modeling debt amount (log-transformed) only among those reporting any debt.
+
+Health condition has about 60% missing. This question was only asked if the participant answered "yes" to at least one disability-related question. In analysis, this is only modeled for those who is observed, missing values are not imputed, so it could be a limitation for the analysis.
+
+Some respondents reported negative or zero for monthly income, which are coded as missing income data. The missingness is not at random and may reflect some financial instability issues.
+
+## Primary Model
+```{r}
+mean(pu12$DocVisit)
+var(pu12$DocVisit)
+table(pu12$DocVisit)
+```
+
+The mean number of doctor's visits is 5.26, while the variance was much larger at 115.1.A standard Poisson regression might not fit the data due to overdispersion and excess zeros. So I chose to use Negative Binomial model. However, since nearly 20% of respondents reported no doctor visits, I also implemented two-part model for additional clarity and to more directly address my primary research question: (1) a logistic regression predicting the likelihood of any doctor visit, (2) a Negative Binomial regression predicting the frequency of visits among those with at least one visit.
+
+```{r}
+# Do people with medical debt avoid seeing doctor entirely?
+logit_model <- glm(VisitedDoc ~ HasDebt + Age + Sex + Race + Educ + LogIncome, data = pu12, family = binomial(link='logit'))
+summary(logit_model)
+```
+
+```{r}
+exp(0.538524) # with medical debt
+exp(0.029305) # age
+exp(-0.677710) # sex 
+exp(-0.203274) # black
+exp(0.786937) # masters or above
+exp(0.047343) # income
+```
+
+People who have medical debt have about 71% higher odds of having any doctor visit, compared to people without debt, holding all else constant (and it is statistically significant, p < 0.01). This is somewhat different than the expected direction I wanted to go. I expected people with debt would visit doctor less, but the result also makes sense. It could be that people with debt often have ongoing medical issues that require frequent visits, leading both to increased medical debt and healthcare utilization. 
+
+Each additional year increases the odds by about 3%. This result also makes sense since older people are more likely to visit a doctor. 
+
+Compared to male respondents, females have about 49% lower odds of visiting at least once, the result is statistically significant (p < 0.01). Black individuals have statistically significant (p < 0.01) lower odds (about 18%) of having a visit compared to white individuals.
+
+Individuals with a Masters or above have 2.196 times higher odds of having a doctor visit, indicating more than double the odds of visiting a doctor compared to those with only a high school diploma. This result is statistically significant (p < 0.01).
+
+Higher income slightly increases the odds of having a visit, each one-unit increase in log income increases the odds of visiting a doctor about 5%, the result is statistically significant (p < 0.01).
+
+
+```{r}
+# Among those who do seek care, does medical debt affect the frequency of visits?
+pu12_doc <- pu12 %>% filter(DocVisit > 0)
+model <- glm.nb(DocVisit ~ HasDebt + Age + Sex + Race + Educ + LogIncome, data = pu12_doc)
+summary(model)
+```
+
+```{r}
+exp(0.4013574) # with medical debt
+exp(0.0081360) # age
+exp(-0.1563791) # sex 
+exp(-0.1948340) # asian
+exp(-0.1165952) # black
+exp(0.786937) # masters or above
+exp(-0.0403238) # income
+```
+Among individuals who had at least one visit, those with medical debt have approximately 49.3% higher rate of doctor visits than those without medical debt. The result is statistically significant(p < 0.01). Again, suggests that individuals who owe medical debt might have ongoing, chronic, or severe health problems requiring more frequent care.
+
+Older age positively predicts more visits. Each additional year of age is associated with 0.8% increase in the rate of doctor visit, which is statistically significant (p < 0.01). Females who have at least one visit typically have fewer visits compared to males, 14.5% lower rate of doctor visits.
+
+Asian and Black respondents both have fewer visits compared to White respondents who have at least one visit. Asian individuals 18% lower rate, black individuals 11% lower. Other race categories are not statistically significant.
+
+Education levels are not statistically significant among people who have at least one visit, suggesting education mainly influences decision to visit or not.
+
+Higher income is associated with a 4% lower rate of doctor visits, which is different than what I found earlier.
+
+
+## Graphic representation
+
+To visualize the overall relationship between medical debt and the probability of visiting a doctor, I first generate an effect plot from my logistic regression model. This plot shows how the predicted probability of visiting a doctor changes as medical debt status changes, while holding other variables constant.
+
+```{r}
+plot(Effect(focal.predictors = "HasDebt", logit_model))
+```
+To make the results even more accessible, I also made a barplot of the predicted probabilities for each group (with and without medical debt), holding all other variables at their mean or reference values. This approach provides a straightforward visual comparison of the likelihood of seeking care between the two groups, directly addressing the research question.
+
+```{r}
+# create dataset for prediction
+pred_data <- data.frame(
+  HasDebt = c(0, 1),
+  Age = mean(pu12$Age, na.rm = TRUE),
+  Sex = mean(pu12$Sex, na.rm = TRUE),
+  LogIncome = mean(pu12$LogIncome, na.rm = TRUE),
+  Race = "White",
+  Educ = "HS diploma or less"
+)
+
+pred_data$Race <- factor(pred_data$Race, levels = levels(pu12$Race))
+pred_data$Educ <- factor(pred_data$Educ, levels = levels(pu12$Educ))
+
+# predict probabilities
+pred_data$pred_prob <- predict(logit_model, newdata = pred_data, type = "response")
+
+ggplot(pred_data, aes(x = factor(HasDebt, labels = c("No Debt", "Has Debt")), y = pred_prob, fill = factor(HasDebt))) +
+  geom_bar(stat = "identity", width = 0.5) +
+  scale_fill_manual(values = c("skyblue", "salmon")) +
+  labs(title = "Predicted Probability of Visiting a Doctor by Medical Debt",
+       x = "Medical Debt Status",
+       y = "Predicted Probability") +
+  theme_minimal() +
+  ylim(0,1)
+```
+This graph shows the predicted probability of having at least one doctor visit in the past year, as estimated by the logistic regression model and holding other covariates at their mean or reference levels. Individuals with medical debt have a higher predicted probability of seeing a doctor compared to those without medical debt (about 75% vs. 85%). Similar to the regression result, this might suggest that people with medical debt are more likely to use healthcare, because those with ongoing health needs both accumulate debt and require frequent doctor visits, leading to a positive association between debt and utilization.
+
+
+## Additional model for comparison
+```{r}
+# interaction with income level
+# test whether debt effect differs significantly by income
+model_income <- glm.nb(DocVisit ~ HasDebt * LogIncome + Age + Sex + Educ + Race, data = pu12)
+summary(model_income)
+```
+I tested whether the effect of medical debt on healthcare utilization (number of doctor visits) varies by income level by including an interaction between HasDebt and LogIncome. The interaction term was small and statistically insignificant (p = 0.64), indicating that the association between medical debt and doctor visits does not differ by income level in this sample.
+
+
+```{r}
+model_mental <- glm(MentalHealth ~ HasDebt + Age + Sex + Race + Educ + LogIncome, data = pu12, family = binomial)
+summary(model_mental)
+```
+To address the secondary question of whether medical debt is associated with psychological distress, I used a logistic regression model predicting whether respondents reported a mental or emotional disorder. The coefficient for medical debt was not statistically significant (p = 0.85), suggesting that in this sample, owing medical debt was not associated with increased odds of reporting a mental or emotional disorder, after adjusting for sociodemographic factors. 
+
+
+I wanted run another negative binomial regression among individuals with debt, but this time using lag-transformed medical debt amount as key predictor. I wonder if with the debt increases, the marginal impact of debt would decrease.
+
+```{r}
+pu12_debt <- pu12 %>% filter(HasDebt == 1, !is.na(LogDebtAmount), !is.na(DocVisit))
+model <- glm.nb(DocVisit ~ LogDebtAmount + Age + Sex + Race + Educ + LogIncome, data = pu12_debt)
+summary(model)
+```
+```{r}
+exp(0.035724)
+log(1000+1)
+log(10000+1)
+log(10000+1) - log(1000+1)
+exp(0.035724 * 2.3)
+```
+As we see from the coefficient, each one unit increase in log debt amount is associated with a 3.6% increase in the expected number of doctor visit, contolling for all other variables. And for context, log(1000+1) = 6.91, log(10000+1) = 9.21, the difference is about 2.3, so going from 1000 dollars to 10,000 dollars in medical debt is associated with about an 8.6% increase in visit frequency.  This supports the hypothesis that the marginal effect of additional debt deminishes as the total owed increases, each extra dollar has less impact at higher debt level.
+
+
+## Graphic representation
+To explore how the amount of medical debt relates to healthcare use, I created a boxplot of the number of doctor visits by quartile of debt amount (for those with debt). I think the boxplot is an effective way to show the distribution, median, and spread of visit counts within each debt group, can highlight both typical experiences and the presence of outliers.
+
+```{r}
+ggplot(pu12_debt, aes(x = cut(LogDebtAmount, breaks=4), y = DocVisit)) +
+  geom_boxplot(fill = "salmon") +
+  labs(title = "Doctor Visits by Quartile of Log Debt Amount (Debtors Only)",
+       x = "Quartile of Log Debt Amount",
+       y = "Number of Doctor Visits") +
+  theme_minimal()
+```
+From the boxplot, we can see as debt amounts increase, there are more individuals with unusually high numbers of doctor visits, especially visible as outliers in the third quartile, suggesting that a subset of higher-debt individuals may be those with chronic or severe health issues requiring frequent care. This supports the regression finding earlier. However, the pattern is not strictly linear, and the highest debt group (fourth quartile) does not have more outliers than the lowest, I wonder if this is suggesting something here. One possibility is that people in the highest debt group may have already accumulated significant debt from prior healthcare utilization, and are now may be limiting additional care. But alternatively, the lower number of outliers in the top quartile could simply be a function of small sample sizes or random variation.
+
+
+## Summary
+
+This analysis provides some new evidence on the relationship between medical debt and healthcare utilization in the United States. Contrary to my original hypothesis, the results consistently show that individuals with medical debt are actually more likely to seek medical care than those without debt, both in terms of the probability of having any doctor visit and in the frequency of visits among those who do see a provider. This likely reflects that people who develop medical debt often do so precisely because they have higher and ongoing health needs, rather than because debt deters care outright.
+
+Additional models found that the association between debt and doctor visits does not significantly differ by income, and there was no statistically significant link between medical debt and self-reported mental or emotional disorders after controlling for demographics. Among those with medical debt, having a higher debt amount is associated with more doctor visits, though the effect size is modest and the pattern is not strictly linear. Descriptive plots suggest that, at the highest debt levels, some individuals may be limiting further care, possibly due to financial exhaustion or barriers, though this pattern could also be due to sample size or random variation.
+
+Overall, these findings highlight the complex relationship between financial barriers and healthcare utilization. While medical debt does not appear to prevent care for most people, it is closely linked to higher healthcare use, likely reflecting the chronic or acute health conditions that both drive and result from debt. These results suggest that policies focused solely on debt relief may not fully address the underlying health needs that lead to debt accumulation (I don't know if I can tell Undue Medical Debt this, I mean after all they are doing a good job helping people), and that ongoing monitoring and support for high-need populations is essential. 
